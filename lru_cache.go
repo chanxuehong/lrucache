@@ -25,11 +25,11 @@ type payload struct {
 
 //                              front                           back
 //                            +-------+       +-------+       +-------+
-// lruList:list.List          |       |------>|       |------>|       |
+// lruList:*list.List         |       |------>|       |------>|       |
 //                            |payload|<------|payload|<------|payload|
 //                            +-------+       +-------+       +-------+
 //                                ^               ^               ^
-// payloadMap:                    |               |               |
+// itemMap:                    |               |               |
 // map[interface{}]*list.Element  |               |               |
 //      +------+------+           |               |               |
 //      | key  |value-+-----------+               |               |
@@ -40,43 +40,44 @@ type payload struct {
 //      +------+------+
 //
 // Principle:
-//   1. len(payloadMap) == lruList.Len();
-//   2. for Element of lruList, we get payloadMap[Element.Value.(*payload).Key] == Element;
+//   1. len(itemMap) == lruList.Len();
+//   2. for Element of lruList, we get
+//      itemMap[Element.Value.(*payload).Key] == Element;
 //   3. in the list lruList, the younger element is always
 //      in front of the older elements;
 //
 
 // Cache is a thread-safe fixed size LRU cache.
 type Cache struct {
-	mutex      sync.Mutex
-	size       int
-	lruList    *list.List
-	payloadMap map[interface{}]*list.Element
+	mutex   sync.Mutex
+	size    int
+	lruList *list.List
+	itemMap map[interface{}]*list.Element
 }
 
-// New creates an LRU of the given size
+// New creates an LRU cache of the given size. if size<=0, will panic.
 func New(size int) (cache *Cache) {
 	if size <= 0 {
 		panic(fmt.Sprintf("size must be > 0 and now == %d", size))
 	}
 
 	cache = &Cache{
-		size:       size,
-		lruList:    list.New(),
-		payloadMap: make(map[interface{}]*list.Element, size),
+		size:    size,
+		lruList: list.New(),
+		itemMap: make(map[interface{}]*list.Element, size),
 	}
 	return
 }
 
 // Size returns the size of cache.
-func (cache *Cache) Size() (n int) {
+func (cache *Cache) Size() (size int) {
 	cache.mutex.Lock()
-	n = cache.size
+	size = cache.size
 	cache.mutex.Unlock()
 	return
 }
 
-// SetSize set a new size for the cache. if size <=0, we do nothing.
+// SetSize sets a new size for the cache. if size <=0, we do nothing.
 func (cache *Cache) SetSize(size int) {
 	if size <= 0 {
 		return
@@ -85,14 +86,10 @@ func (cache *Cache) SetSize(size int) {
 	cache.mutex.Lock()
 	defer cache.mutex.Unlock()
 
-	n := cache.lruList.Len() - size
-	if n <= 0 {
-		cache.size = size
-		return
-	}
-
-	for i, e := n, cache.lruList.Back(); i > 0; i, e = i-1, cache.lruList.Back() {
-		cache.remove(e)
+	if n := cache.lruList.Len() - size; n > 0 {
+		for i, e := n, cache.lruList.Back(); i > 0; i, e = i-1, cache.lruList.Back() {
+			cache.remove(e)
+		}
 	}
 
 	cache.size = size
@@ -107,43 +104,54 @@ func (cache *Cache) Len() (n int) {
 	return
 }
 
-// add key-value to cache.
-// ensure that there is no item with the same key in cache
+// Purge is used to completely clear the cache
+func (cache *Cache) Purge() {
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	cache.lruList = list.New()
+	cache.itemMap = make(map[interface{}]*list.Element, cache.size)
+}
+
+// add adds key-value to cache.
+//  ensure that there is no item with the same key in cache
 func (cache *Cache) add(key, value interface{}) (err error) {
 	if cache.lruList.Len() >= cache.size {
-		e := cache.lruList.Back() // e != nil
+		e := cache.lruList.Back() // e != nil, for cache.size > 0
 		payload := e.Value.(*payload)
 
-		delete(cache.payloadMap, payload.Key)
+		delete(cache.itemMap, payload.Key)
 
 		payload.Key = key
 		payload.Value = value
 
-		cache.payloadMap[key] = e
+		cache.itemMap[key] = e
 		cache.lruList.MoveToFront(e)
 		return
 	}
 
-	// now create new
-	cache.payloadMap[key] = cache.lruList.PushFront(&payload{
+	cache.itemMap[key] = cache.lruList.PushFront(&payload{
 		Key:   key,
 		Value: value,
 	})
 	return
 }
 
-// remove Element e from Cache.lruList.
-// ensure that e != nil and e is an element of list lruList.
+// remove removes the Element e from cache.lruList.
+//  ensure that e != nil and e is an element of list lruList.
 func (cache *Cache) remove(e *list.Element) {
-	delete(cache.payloadMap, e.Value.(*payload).Key)
+	delete(cache.itemMap, e.Value.(*payload).Key)
 	cache.lruList.Remove(e)
 }
 
-// Add key-value to cache.
+// Add adds key-value to cache.
 // if there already exists a item with the same key, it returns ErrNotStored.
-func (cache *Cache) Add(key string, value interface{}) (err error) {
+//
+//  NOTE: the comparison operators == and != must be fully defined for
+//        operands of the key type.
+func (cache *Cache) Add(key, value interface{}) (err error) {
 	cache.mutex.Lock()
-	if _, hit := cache.payloadMap[key]; hit {
+	if _, hit := cache.itemMap[key]; hit {
 		err = ErrNotStored
 
 		cache.mutex.Unlock()
@@ -156,10 +164,13 @@ func (cache *Cache) Add(key string, value interface{}) (err error) {
 	}
 }
 
-// Set key-value to cache, unconditional
+// Set sets key-value to cache, unconditional
+//
+//  NOTE: the comparison operators == and != must be fully defined for
+//        operands of the key type.
 func (cache *Cache) Set(key, value interface{}) (err error) {
 	cache.mutex.Lock()
-	if e, hit := cache.payloadMap[key]; hit {
+	if e, hit := cache.itemMap[key]; hit {
 		payload := e.Value.(*payload)
 
 		// payload.Key = key
@@ -177,16 +188,18 @@ func (cache *Cache) Set(key, value interface{}) (err error) {
 }
 
 // Get looks up a key's value from the cache.
-//  if there is no such element with the key it returns ErrNotFound.
+// if there is no such item with the key it returns ErrNotFound.
+//
+//  NOTE: the comparison operators == and != must be fully defined for
+//        operands of the key type.
 func (cache *Cache) Get(key interface{}) (value interface{}, err error) {
 	cache.mutex.Lock()
-	if e, hit := cache.payloadMap[key]; hit {
+	if e, hit := cache.itemMap[key]; hit {
 		cache.lruList.MoveToFront(e)
 		value = e.Value.(*payload).Value
 
 		cache.mutex.Unlock()
 		return
-
 	} else {
 		err = ErrNotFound
 
@@ -196,11 +209,14 @@ func (cache *Cache) Get(key interface{}) (value interface{}, err error) {
 }
 
 // Remove removes the provided key from the cache.
-//  if there is no such element with the key it returns ErrNotFound,
-//  normally you can ignore this error.
+// if there is no such item with the key it returns ErrNotFound,
+// normally you can ignore this error.
+//
+//  NOTE: the comparison operators == and != must be fully defined for
+//        operands of the key type.
 func (cache *Cache) Remove(key interface{}) (err error) {
 	cache.mutex.Lock()
-	if e, hit := cache.payloadMap[key]; hit {
+	if e, hit := cache.itemMap[key]; hit {
 		cache.remove(e)
 
 		cache.mutex.Unlock()
